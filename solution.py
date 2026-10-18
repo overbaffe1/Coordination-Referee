@@ -4,16 +4,17 @@
 Contract:
     python solution.py --train train.csv --test test.csv --output predictions.csv
 
-Pipeline
-    run -> semantic events (templates mined from the simulator vocabulary)
-        -> structural evidence features (handoff accounting, wait ping-pong,
-           state conflicts, drift shift, loop series, run endings)
-        -> LightGBM (label + success)
-        -> BiGRU sequence model over events (GPU if available, CPU fallback)
-        -> logit blend + macro-F1 class offsets
-        -> rule-based fault_turn localisation per predicted class
+Three execution modes, chosen automatically:
 
-Deterministic: fixed seeds everywhere. No network access required.
+1. weights/   -> pre-trained models shipped in this archive: LightGBM label
+                 + LightGBM success + bagged BiGRU sequence nets. Only
+                 inference runs here (a couple of minutes).
+2. no weights -> quick in-job training of the LightGBM heads on the provided
+                 train.csv (few minutes), same feature pipeline.
+3. smoke test -> test.csv lacks the run columns (only submission columns):
+                 write a valid constant predictions.csv and exit 0.
+
+Deterministic: fixed seeds everywhere; no network access needed.
 """
 from __future__ import annotations
 
@@ -28,17 +29,15 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-
-T0 = time.time()
+sys.path.insert(0, os.path.join(HERE, "sol"))
 
 LABELS = ["clean", "dropped_handoff", "duplicated_work", "deadlock",
           "conflict", "goal_drift", "runaway_loop"]
 LIDX = {l: i for i, l in enumerate(LABELS)}
 RUN_COLUMNS = ["goal", "agents", "shared_state", "messages", "artifacts", "topology"]
+DEFAULT_OFFSETS_LGB = np.array([-0.60, -0.20, -0.50, 0.10, -0.60, 0.55, 0.00])
 
-# macro-F1 class offsets tuned on train OOF
-OFFSETS = np.array([-0.65, -0.25, -0.55, 0.15, -0.65, 0.60, 0.00])
-NN_WEIGHT = 0.70          # weight of the NN logits in the blend
+T0 = time.time()
 
 
 def log(msg):
@@ -52,335 +51,233 @@ def write_fallback(test, path, why):
                   "fault_turn": -1}).to_csv(path, index=False)
 
 
-# ---------------------------------------------------------------- features
-def build_matrices(train, test):
+# --------------------------------------------------------------- features
+def build_matrix(df, jobs=1):
     from features4 import extract_features
     from engine import parse_run
-    Xtr, runs_tr = [], []
-    for rec in train.to_dict("records"):
-        run = parse_run(rec)
-        Xtr.append(extract_features(run))
-        runs_tr.append(run)
-    Xte, runs_te = [], []
-    for rec in test.to_dict("records"):
-        run = parse_run(rec)
-        Xte.append(extract_features(run))
-        runs_te.append(run)
-    cols = sorted(set().union(*[r.keys() for r in Xtr]))
-    Xtr = pd.DataFrame(Xtr).reindex(columns=cols).fillna(0.0)
-    Xte = pd.DataFrame(Xte).reindex(columns=cols).fillna(0.0)
-    return Xtr, Xte, runs_tr, runs_te
+    from multiprocessing import Pool
 
+    recs = df.to_dict("records")
 
-# ---------------------------------------------------------------- lightgbm
-def fit_lgb(Xtr, y, task):
-    import lightgbm as lgb
-    if task == "multi":
-        m = lgb.LGBMClassifier(
-            objective="multiclass", num_class=7, n_estimators=1200,
-            learning_rate=0.04, num_leaves=63, min_child_samples=20,
-            subsample=0.9, subsample_freq=1, colsample_bytree=0.8,
-            reg_lambda=1.0, n_jobs=-1, random_state=42, verbose=-1)
+    def _work(rec):
+        run = parse_run(rec)
+        return extract_features(run)
+
+    if jobs > 1 and len(recs) > 400:
+        with Pool(jobs) as p:
+            feats = p.map(_work, recs, chunksize=32)
     else:
-        m = lgb.LGBMClassifier(
-            objective="binary", n_estimators=800, learning_rate=0.05,
-            num_leaves=63, subsample=0.9, subsample_freq=1,
-            colsample_bytree=0.8, reg_lambda=1.0, n_jobs=-1,
-            random_state=42, verbose=-1)
-    m.fit(Xtr, y)
-    return m
+        feats = [_work(r) for r in recs]
+    cols = sorted(set().union(*[f.keys() for f in feats]))
+    X = pd.DataFrame(feats).reindex(columns=cols).fillna(0.0).astype(np.float32)
+    return X, recs
 
 
-# ---------------------------------------------------------------- sequence NN
-def train_nn(runs_tr, Ttr, y, epochs, seeds, device):
-    import torch
-    from nn_model import SeqModel, build_sequence, pad_batch
-    torch.manual_seed(42)
-    np.random.seed(42)
-    seqs = [build_sequence(r) for r in runs_tr]
-    Ttr_t = torch.from_numpy(Ttr.astype(np.float32))
-    ytr_t = torch.from_numpy(y)
-    proba = np.zeros((len(y), 7), dtype=np.float64)  # test proba accumulator
-    return_none = None
-    models = []
-    for seed in seeds:
-        torch.manual_seed(seed)
-        model = SeqModel(Ttr.shape[1]).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-2)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-        lossf = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
-        n = len(seqs)
-        for ep in range(epochs):
-            model.train()
-            perm = np.random.permutation(n)
-            for i in range(0, n, 64):
-                idx = perm[i:i + 64]
-                xb, mask = pad_batch([seqs[j] for j in idx], device)
-                tb = Ttr_t[idx].to(device)
-                yb = ytr_t[idx].to(device)
-                loss = lossf(model(xb, tb, mask), yb)
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-            sch.step()
-            if time.time() - T0 > 1380:      # hard wall-clock guard
-                log("NN: time guard hit, stopping training early")
-                break
-        models.append(model)
-    return models, seqs
+def parse_runs(recs):
+    from engine import parse_run
+    return [parse_run(r) for r in recs]
 
 
-def nn_predict(models, seqs_tr_stat, runs_te, Tte, device):
-    import torch
-    from nn_model import build_sequence, pad_batch
-    seqs_te = [build_sequence(r) for r in runs_te]
-    Tte_t = torch.from_numpy(Tte.astype(np.float32))
-    out = np.zeros((len(runs_te), 7), dtype=np.float64)
-    with torch.no_grad():
-        for model in models:
-            model.eval()
-            preds = []
-            for i in range(0, len(seqs_te), 256):
-                xb, mask = pad_batch(seqs_te[i:i + 256], device)
-                tb = Tte_t[i:i + 256].to(device)
-                preds.append(torch.softmax(model(xb, tb, mask), -1).cpu().numpy())
-            out += np.concatenate(preds)
-    return out / max(1, len(models))
+def reindex_like(X, cols):
+    return X.reindex(columns=cols).fillna(0.0).astype(np.float32)
 
 
-# ---------------------------------------------------------------- fault turn
-from features4 import wait_parts, sub_eq  # noqa: E402
-from engine import events_of  # noqa: E402
+# --------------------------------------------------------------- in-job training
+def quick_train(X, y, s):
+    import lightgbm as lgb
+    lab = lgb.LGBMClassifier(
+        objective="multiclass", num_class=7, n_estimators=1200,
+        learning_rate=0.04, num_leaves=63, min_child_samples=20,
+        subsample=0.9, subsample_freq=1, colsample_bytree=0.8,
+        reg_lambda=1.0, n_jobs=-1, random_state=42, verbose=-1)
+    lab.fit(X, y)
+    lab_1h = np.zeros((len(y), 7), dtype=np.float32)
+    lab_1h[np.arange(len(y)), y] = 1
+    Xs = np.hstack([X.values.astype(np.float32), lab_1h])
+    suc = lgb.LGBMClassifier(
+        objective="binary", n_estimators=800, learning_rate=0.05,
+        num_leaves=63, subsample=0.9, subsample_freq=1, colsample_bytree=0.8,
+        reg_lambda=1.0, n_jobs=-1, random_state=42, verbose=-1)
+    suc.fit(Xs, s)
+    return lab, suc
 
 
-def productions(run):
-    prod, prod_t = set(), []
-    for e in run["events"]:
-        if e["kind"] == "deliver" and e["sub"]:
-            prod.add(e["sub"])
-            prod_t.append((e["t"], e["from"], e["sub"]))
-    for a in run["artifacts"]:
-        if a.get("subtask") and a.get("status") != "copy":
-            prod.add(a["subtask"])
-            prod_t.append((a.get("t", 0), a.get("by"), a["subtask"]))
-    return prod, prod_t
-
-
-def localize(run, label):
-    ev = run["events"]
-    n = len(ev)
-    if not ev or label == "clean":
-        return -1
-    prod, prod_t = productions(run)
-    assigns = [e for e in ev if e["kind"] in ("assign", "assign_maybe") and e["sub"]]
-
-    if label == "dropped_handoff":
-        silent, engaged_first = [], []
-        for a in assigns:
-            s, to, t = a["sub"], a["to"], a["t"]
-            if s in prod:
-                continue
-            onsub = [e for e in ev if e["t"] > t and e["from"] == to and sub_eq(e["sub"], s)]
-            kinds = set(e["kind"] for e in onsub) & {
-                "work", "deliver", "state_write", "wait", "loop",
-                "conflict_msg", "recovery"}
-            if kinds:
-                continue
-            after = [e for e in ev if e["t"] > t and e["from"] == to]
-            if not after:
-                silent.append(t)
-            else:
-                engaged_first.append(t)
-        if silent:
-            return int(silent[0])
-        if engaged_first:
-            return int(engaged_first[0])
-        return int(assigns[0]["t"]) if assigns else (ev[0]["t"])
-
-    if label == "duplicated_work":
-        pa = defaultdict(set)
-        for t, ag, s in prod_t:
-            pa[s].add(ag)
-        by_sub = defaultdict(list)
-        for a in assigns:
-            by_sub[a["sub"]].append(a)
-        best = None
-        for s, lst in by_sub.items():
-            for i in range(1, len(lst)):
-                a0, a1 = lst[i - 1], lst[i]
-                if a0["from"] != a1["from"]:
-                    continue
-                if len({a0["to"], a1["to"]} & pa.get(s, set())) >= 2:
-                    if best is None or a1["t"] < best:
-                        best = a1["t"]
-        if best is not None:
-            return int(best)
-        counts = sorted(by_sub.items(), key=lambda kv: -len(kv[1]))
-        if counts and len(counts[0][1]) >= 2:
-            return int(counts[0][1][1]["t"])
-        return int(ev[len(ev) // 2]["t"])
-
-    if label == "deadlock":
-        wp = defaultdict(list)
-        for w in events_of(run, "wait"):
-            s, tg = wait_parts(w["text"])
-            wp[(w["from"], tg or w["to"])].append((w["t"], s))
-        pairs = []
-        for (a, b), ws in wp.items():
-            if a < b and wp.get((b, a)):
-                allw = sorted(ws + wp[(b, a)])
-                pairs.append((allw[-1][0], allw[0][0], len(allw)))
-        if pairs:
-            pairs.sort(key=lambda p: (-p[0], p[1]))
-            return int(pairs[0][1])
-        streak = best_len = best_t = cur = 0
-        for e in ev:
-            if e["kind"] == "wait":
-                if cur == 0:
-                    start = e["t"]
-                cur += 1
-                if cur > best_len:
-                    best_len, best_t = cur, start
-            else:
-                cur = 0
-        return int(best_t) if best_len else int(ev[0]["t"])
-
-    if label == "conflict":
-        per_key = defaultdict(list)
-        for s in run["shared_state"]:
-            if s.get("key") == "run_status":
-                continue
-            per_key[s["key"]].append(s)
-        best_t, best_sc = None, -1
-        for k, recs in per_key.items():
-            ovs = [int(r.get("t", 0)) for r in recs if r.get("op") == "override"]
-            vals = [r.get("value") for r in recs]
-            alt = sum(1 for i in range(2, len(vals))
-                      if vals[i] == vals[i - 2] and vals[i] != vals[i - 1])
-            sc = len(ovs) + alt
-            if sc > best_sc and ovs:
-                best_sc, best_t = sc, min(ovs)
-        if best_t is not None:
-            return int(best_t)
-        cf = events_of(run, "conflict_msg")
-        if cf:
-            return int(cf[0]["t"])
-        return int(ev[0]["t"])
-
-    if label == "goal_drift":
-        drifts = events_of(run, "drift")
-        if not drifts:
-            return int(ev[len(ev) // 2]["t"])
-        early_full = None
-        best_t, best_n = None, -1
-        for d in drifts:
-            t0 = d["t"]
-            early = {e["sub"] for e in ev if e["sub"] and e["t"] <= t0}
-            off = sum(1 for e in ev if e["t"] > t0 and e["sub"] and
-                      e["sub"] not in early and
-                      e["kind"] in ("work", "deliver", "assign"))
-            if off > best_n:
-                best_n, best_t = off, t0
-        return int(best_t if best_t is not None else drifts[0]["t"])
-
-    if label == "runaway_loop":
-        loops = events_of(run, "loop")
-        if loops:
-            def nrm(t):
-                t = (t or "").lower()
-                t = re.sub(r"art_\S+|a\d+", "@", t)
-                t = re.sub(r"\d+", "#", t)
-                return re.sub(r"\s+", " ", t).strip()
-            by_key = defaultdict(list)
-            for e in loops:
-                by_key[(e["from"], e["sub"] or nrm(e["text"]))].append(e)
-            best = max(by_key.values(), key=len)
-            return int(best[0]["t"])
-        return int(ev[len(ev) // 2]["t"])
-
-    return -1
-
-
-import re  # noqa: E402
-from collections import defaultdict  # noqa: E402
-
-
+# --------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True)
     ap.add_argument("--test", required=True)
     ap.add_argument("--output", default="predictions.csv")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     args = ap.parse_args()
 
-    train = pd.read_csv(args.train)
     test = pd.read_csv(args.test)
-    log("train=%d test=%d" % (len(train), len(test)))
+    log("test=%d rows" % len(test))
 
-    if any(c not in test.columns for c in RUN_COLUMNS) or \
-            any(c not in train.columns for c in RUN_COLUMNS + ["label", "success"]):
-        write_fallback(test, args.output, "input is not a full run table")
+    if any(c not in test.columns for c in RUN_COLUMNS) or "run_id" not in test.columns:
+        write_fallback(test, args.output, "test.csv has no run fields (smoke mode)")
         return
 
-    log("extracting features")
-    Xtr, Xte, runs_tr, runs_te = build_matrices(train, test)
-    log("features: %d" % Xtr.shape[1])
+    # ------------------------------------------------- weights
+    wdir = os.path.join(HERE, "weights")
+    meta = None
+    if os.path.exists(os.path.join(wdir, "meta.json")):
+        try:
+            with open(os.path.join(wdir, "meta.json")) as f:
+                meta = json.load(f)
+            log("weights found: %s" % wdir)
+        except Exception as e:
+            log("meta.json unreadable (%s) -> in-job training" % e)
 
-    y = train["label"].map(LIDX).values
-    s = train["success"].values.astype(int)
+    feat_cols = (meta or {}).get("feature_cols")
+    has_lgb_lab = meta is not None and os.path.exists(os.path.join(wdir, "lgb_label.txt"))
+    has_lgb_suc = meta is not None and os.path.exists(os.path.join(wdir, "lgb_success.txt"))
+    nn_seeds = (meta or {}).get("nn_seeds") or []
+    has_nn = bool(nn_seeds) and feat_cols is not None and \
+        all(os.path.exists(os.path.join(wdir, "nn_seed%d.pt" % sd)) for sd in nn_seeds)
+    if has_nn:
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            log("torch not available -> NN disabled")
+            has_nn = False
 
-    # ---------------- lightgbm label ----------------
-    log("fitting LGBM label")
-    lgb_lab = fit_lgb(Xtr, y, "multi")
-    pr = lgb_lab.predict_proba(Xte)
-    cols = [int(c) if not isinstance(c, str) else LIDX[c] for c in lgb_lab.classes_]
-    p_lgb = np.zeros((len(Xte), 7))
-    p_lgb[:, cols] = pr
-    p_lgb_tr = None
+    need_train = not (has_lgb_lab and has_lgb_suc)
+    train = None
+    if need_train:
+        train = pd.read_csv(args.train)
+        if any(c not in train.columns for c in RUN_COLUMNS) or \
+                "label" not in train.columns or "success" not in train.columns:
+            write_fallback(test, args.output, "no usable train and no weights")
+            return
 
-    # ---------------- sequence NN ----------------
+    # ------------------------------------------------- test features
+    log("extracting test features (%d jobs)" % args.jobs)
+    Xte, recs_te = build_matrix(test, args.jobs)
+    runs_te = parse_runs(recs_te)
+    if feat_cols:
+        Xte = reindex_like(Xte, feat_cols)
+    log("test features: %d" % Xte.shape[1])
+
+    # ------------------------------------------------- label
+    p_lgb = None
+    if has_lgb_lab:
+        import lightgbm as lgb
+        log("LGBM label: loading booster")
+        booster = lgb.Booster(model_file=os.path.join(wdir, "lgb_label.txt"))
+        p_lgb = np.asarray(booster.predict(Xte.values), dtype=np.float64)
+        if p_lgb.ndim == 1:
+            p_lgb = p_lgb.reshape(-1, 7)
+    else:
+        log("LGBM label: quick in-job training")
+        y = train["label"].map(LIDX).values
+        s = train["success"].values.astype(int)
+        Xtr, _ = build_matrix(train, args.jobs)
+        if feat_cols:
+            Xtr = reindex_like(Xtr, feat_cols)
+        lab, suc_injob = quick_train(Xtr, y, s)
+        pr = lab.predict_proba(Xte.values)
+        cols = [int(c) if not isinstance(c, str) else LIDX[c] for c in lab.classes_]
+        p_lgb = np.zeros((len(Xte), 7))
+        p_lgb[:, cols] = pr
+        if not has_lgb_suc:
+            globals()["_suc_injob"] = suc_injob
+
+    # ------------------------------------------------- NN
     p_nn = None
-    try:
-        import torch
-        from sklearn.preprocessing import StandardScaler
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        log("sequence model on %s" % dev)
-        scaler = StandardScaler().fit(Xtr.values)
-        Ttr = scaler.transform(Xtr.values)
-        Tte = scaler.transform(Xte.values)
-        epochs, seeds = (12, [1, 2, 3]) if dev == "cuda" else (8, [1])
-        if dev != "cuda":
-            epochs = 6
-        models, _ = train_nn(runs_tr, Ttr, y, epochs, seeds, dev)
-        p_nn = nn_predict(models, None, runs_te, Tte, dev)
-        del models
-    except Exception as exc:
-        log("NN failed (%s) -> LGBM only" % exc)
+    if has_nn:
+        try:
+            import torch
+            from sklearn.preprocessing import StandardScaler
+            from nn_model import build_sequence, SeqModel, pad_batch
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            mean = np.asarray(meta["scaler_mean"], dtype=np.float32)
+            scale = np.asarray(meta["scaler_scale"], dtype=np.float32)
+            Tte = ((Xte.values - mean) / np.maximum(scale, 1e-8)).astype(np.float32)
+            seqs_te = [build_sequence(r) for r in runs_te]
+            log("NN inference: %d seeds on %s" % (len(nn_seeds), dev))
+            acc = np.zeros((len(Xte), 7), dtype=np.float64)
+            for sd in nn_seeds:
+                model = SeqModel(Tte.shape[1]).to(dev)
+                model.load_state_dict(torch.load(
+                    os.path.join(wdir, "nn_seed%d.pt" % sd),
+                    map_location=dev))
+                model.eval()
+                Tt = torch.from_numpy(Tte)
+                with torch.no_grad():
+                    for i in range(0, len(seqs_te), 256):
+                        xb, mask = pad_batch(seqs_te[i:i + 256], dev)
+                        tb = Tt[i:i + 256].to(dev)
+                        acc[i:i + 256] += torch.softmax(
+                            model(xb, tb, mask), -1).cpu().numpy()
+                del model
+            p_nn = acc / len(nn_seeds)
+        except Exception as e:
+            log("NN inference failed (%s) -> continuing without it" % e)
+            p_nn = None
 
-    # ---------------- blend ----------------
+    # ------------------------------------------------- blend
     import scipy.special as sp
-    if p_nn is not None:
-        logits = NN_WEIGHT * sp.logit(np.clip(p_nn, 1e-6, 1 - 1e-6)) + \
-                 (1 - NN_WEIGHT) * sp.logit(np.clip(p_lgb, 1e-6, 1 - 1e-6))
+    nn_w = float((meta or {}).get("nn_weight", 0.7))
+    if p_nn is not None and p_lgb is not None:
+        logits = nn_w * sp.logit(np.clip(p_nn, 1e-6, 1 - 1e-6)) + \
+                 (1 - nn_w) * sp.logit(np.clip(p_lgb, 1e-6, 1 - 1e-6))
+        offsets = np.asarray(meta.get("offsets_blend",
+                                      meta.get("offsets_lgb", DEFAULT_OFFSETS_LGB)))
+    elif p_nn is not None:
+        logits = sp.logit(np.clip(p_nn, 1e-6, 1 - 1e-6))
+        offsets = np.asarray(meta.get("offsets_blend", DEFAULT_OFFSETS_LGB))
     else:
         logits = sp.logit(np.clip(p_lgb, 1e-6, 1 - 1e-6))
-    pred_idx = (logits + OFFSETS).argmax(1)
+        src = meta.get("offsets_lgb", DEFAULT_OFFSETS_LGB) if meta else DEFAULT_OFFSETS_LGB
+        if p_nn is None and has_nn is False and meta is None:
+            src = DEFAULT_OFFSETS_LGB
+        offsets = np.asarray(src)
+    pred_idx = (logits + offsets).argmax(1)
     pred_label = [LABELS[i] for i in pred_idx]
     log("labels predicted")
 
-    # ---------------- success ----------------
-    log("fitting success model")
-    lab_1h = np.zeros((len(y), 7))
-    lab_1h[np.arange(len(y)), y] = 1
-    Xs = np.hstack([Xtr.values, lab_1h])
-    suc = fit_lgb(pd.DataFrame(Xs), s, "binary")
-    lab_1h_te = np.zeros((len(Xte), 7))
-    lab_1h_te[np.arange(len(Xte)), pred_idx] = 1
-    Xse = np.hstack([Xte.values, lab_1h_te])
-    p_suc = suc.predict_proba(Xse)[:, 1]
+    # ------------------------------------------------- success
+    if has_lgb_suc:
+        import lightgbm as lgb
+        log("LGBM success: loading booster")
+        booster = lgb.Booster(model_file=os.path.join(wdir, "lgb_success.txt"))
+        lab_1h_te = np.zeros((len(Xte), 7), dtype=np.float32)
+        lab_1h_te[np.arange(len(Xte)), pred_idx] = 1
+        Xse = np.hstack([Xte.values.astype(np.float32), lab_1h_te])
+        p_suc = np.asarray(booster.predict(Xse), dtype=np.float64).ravel()
+    else:
+        log("LGBM success: in-job model")
+        if train is None:
+            train = pd.read_csv(args.train)
+        suc = globals().get("_suc_injob")
+        if suc is None:
+            # weights had label but not success: quick fit on provided train
+            y = train["label"].map(LIDX).values
+            s = train["success"].values.astype(int)
+            Xtr = globals().get("_Xtr")
+            if Xtr is None:
+                Xtr, _ = build_matrix(train, args.jobs)
+                if feat_cols:
+                    Xtr = reindex_like(Xtr, feat_cols)
+            lab_1h = np.zeros((len(y), 7), dtype=np.float32)
+            lab_1h[np.arange(len(y)), y] = 1
+            import lightgbm as lgb
+            suc = lgb.LGBMClassifier(
+                objective="binary", n_estimators=800, learning_rate=0.05,
+                num_leaves=63, subsample=0.9, subsample_freq=1,
+                colsample_bytree=0.8, reg_lambda=1.0, n_jobs=-1,
+                random_state=42, verbose=-1)
+            suc.fit(np.hstack([Xtr.values.astype(np.float32), lab_1h]), s)
+        lab_1h_te = np.zeros((len(Xte), 7), dtype=np.float32)
+        lab_1h_te[np.arange(len(Xte)), pred_idx] = 1
+        Xse = np.hstack([Xte.values.astype(np.float32), lab_1h_te])
+        p_suc = suc.predict_proba(Xse)[:, 1]
     pred_success = (p_suc > 0.5).astype(int)
 
-    # ---------------- fault turn ----------------
+    # ------------------------------------------------- fault turn
     log("localising faults")
+    from localize import localize
     pred_turn = [localize(run, lab) for run, lab in zip(runs_te, pred_label)]
 
     out = pd.DataFrame({"run_id": test["run_id"], "label": pred_label,

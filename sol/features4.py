@@ -255,6 +255,51 @@ def extract_features(run):
         prev = x
     f["max_consec_identical"] = best
 
+    # ---------- vocabulary-free robustness block ----------
+    # (the shifted slice uses another domain, so regex kinds may miss;
+    #  these proxies rely only on structural fields: intent/sub, from/to, t)
+    first_seen = {}
+    for e in ev:
+        if e["sub"] and e["sub"] not in first_seen:
+            first_seen[e["sub"]] = e["t"]
+    f["late_new_subs70"] = sum(1 for t in first_seen.values() if t >= int(n * 0.7))
+    icnt = Counter((e["from"], e["sub"]) for e in ev
+                   if e["kind"] in ("work", "loop", "drift") and e["sub"])
+    f["intent_series_max"] = max(icnt.values()) if icnt else 0
+    f["intent_series3"] = sum(1 for v in icnt.values() if v >= 3)
+    by_pair = defaultdict(list)
+    for e in ev:
+        if e["from"] and e["to"]:
+            by_pair[(e["from"], e["to"])].append(e["t"])
+    for k in by_pair:
+        by_pair[k].sort()
+    import bisect
+    no_reply = 0
+    for w in waits:
+        ts = by_pair.get((w["to"], w["from"]))
+        if not ts:
+            no_reply += 1
+        else:
+            i = bisect.bisect_right(ts, w["t"])
+            if i >= len(ts):
+                no_reply += 1
+    f["wait_noreply"] = no_reply
+    f["wait_noreply_frac"] = no_reply / max(1, len(waits))
+
+    def _mono(recs):
+        ts = [r.get("t", 0) for r in recs]
+        if len(ts) < 2:
+            return 1.0
+        m = sum(1 for i in range(1, len(ts)) if ts[i] >= ts[i - 1])
+        return m / (len(ts) - 1)
+
+    # list order vs time order: generator writes records in injection order
+    f["ss_mono"] = _mono(state)
+    f["art_mono"] = _mono(arts)
+    ss_inv = sum(1 for i in range(1, len(state))
+                 if state[i].get("t", 0) < state[i - 1].get("t", 0))
+    f["ss_inversions"] = ss_inv
+
     # ---------- endings ----------
     sys_texts = [e["text"].lower() for e in ev if e["kind"] == "system"]
     f["sys_no_progress"] = int(any("no progress" in t for t in sys_texts))
