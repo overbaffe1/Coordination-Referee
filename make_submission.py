@@ -49,7 +49,15 @@ def main():
 
     with zipfile.ZipFile(args.out, "w", zipfile.ZIP_DEFLATED) as z:
         for path in items:
-            arc = os.path.relpath(path, HERE)
+            # flat archive: modules sit next to solution.py at the zip root
+            arc = os.path.basename(path)
+            if os.path.dirname(os.path.abspath(path)) != HERE and \
+                    os.path.dirname(os.path.abspath(path)) != os.path.abspath("sol"):
+                arc = os.path.relpath(path, HERE)
+            if arc.startswith("sol" + os.sep):
+                arc = os.path.basename(arc)
+            if path.startswith(wdir):
+                arc = os.path.join("weights", os.path.relpath(path, wdir))
             z.write(path, arc)
             print("  +", arc)
     size = os.path.getsize(args.out) / 1e6
