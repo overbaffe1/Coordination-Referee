@@ -2,4 +2,4 @@ data/
 *.csv
 __pycache__/
 weights*/
-*.zip
+*.npy
