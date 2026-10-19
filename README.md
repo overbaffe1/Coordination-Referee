@@ -1,48 +1,127 @@
-# Coordination-Referee — participant solution
+# Coordination Referee — ML-решение чемпионата по диагностике сбоев мультиагентного ИИ
 
-Диагностика сбоев координации в мультиагентных прогонах: `label` (7 классов),
-`success` (0/1), `fault_turn` (int, -1 для clean).
+**Автор:** [@overbaffe1](https://github.com/overbaffe1)
+**Чемпионат:** «Coordination Referee» — диагностика сбоев координации в мультиагентных AI-системах
+**Платформа:** DSWorks (GitVerse), сезон 08.09 – 20.10.2026
+**Стартовый кит организаторов:** [github.com/dmayudin/coordination-referee](https://github.com/dmayudin/coordination-referee)
 
-## Быстрый старт
+---
 
-```bash
-# 1. Обучение офлайн (на боевом train.csv из раздела «Данные» платформы)
-python3 pretrain.py --train data/train_battle.csv --out weights
+## Что это за задача
 
-# 2. Сборка сабмита (плоский zip, solution.py в корне)
-python3 make_submission.py --weights weights --out submission.zip
+Мультиагентные системы (оркестратор + агенты) выполняют задачи, обмениваясь сообщениями,
+пишут в общее состояние (`shared_state`) и артефакты. Генератор симуляции незаметно вводит
+в часть прогонов **сбой координации**. Нужно по логу прогона (цель, агенты, сообщения,
+состояние, артефакты, топология) поставить «реферси»-диагноз:
 
-# 3. Локальная проверка контракта
-python3 solution.py --train data/train_battle.csv --test data/test.csv --output predictions.csv
+| выход | что это |
+|---|---|
+| `label` | класс сбоя: `clean`, `dropped_handoff`, `duplicated_work`, `deadlock`, `conflict`, `goal_drift`, `runaway_loop` |
+| `success` | завершился ли прогон успешно (0/1) |
+| `fault_turn` | ход, с которого начался сбой (−1 для clean) |
+
+**Метрика лидерборда** (итоговый score, больше — лучше):
+
+```
+score = 0.50·MacroF1 + 0.25·RobustnessF1 + 0.15·SuccessF1 + 0.10·fault_turn_hit@2
 ```
 
-Зависимости: `pip3 install --break-system-packages pandas numpy scikit-learn lightgbm scipy torch`
-(GPU используется автоматически, если видна CUDA).
+- MacroF1 по 7 классам; RobustnessF1 — то же на ~33% теста со сдвигом (больше агентов,
+  длинные логи, редкие топологии, другой домен и словарь формулировок);
+- `hit@2` — верный класс И попадание в ход ±2;
+- ограничения джобы: обучение+инференс ≤ 30 мин, 8 vCPU / 32 ГБ / опц. A100, без сети;
+  сабмит — zip с `solution.py` в корне (`python solution.py --train train.csv --test test.csv --output predictions.csv`).
 
-## Три режима solution.py (выбираются автоматически)
+## Результаты
 
-1. **weights/ в архиве** — только инференс предобученных моделей (~1 мин на 4k ранов).
-2. **нет weights/** — быстрое обучение LightGBM-голов в самом job'е (~2–3 мин на 8 vCPU).
-3. **smoke-тест** (в test.csv только колонки сабмита) — константный predictions.csv, exit 0.
+| | score | MacroF1 | RobustnessF1 | SuccessF1 | hit@2 |
+|---|---|---|---|---|---|
+| Официальный baseline оргов | 0.712 | 0.741 | 0.706 | 0.853 | 0.361 |
+| Референс оргов (+TF-IDF) | 0.738 | — | — | — | — |
+| **Это решение (holdout 1500)** | **0.864** | 0.857 | 0.867 | 0.910 | 0.821 |
+| Это решение (OOF, 10 000 ранов) | — | 0.853 | — | — | — |
 
-## Архитектура
+Боевой train организаторы в публичный доступ так и не выложили, поэтому модели обучены
+на **всём существующем размеченном датасете** (10 000 ранов, официальный стартовый кит —
+это разрешено п. 5.3 правил).
 
-| Файл | Что делает |
-|---|---|
-| `pretrain.py` | офлайн-обучение: LGBM(label)+LGBM(success)+BiGRU-бэггинг, тюнинг порогов на OOF, всё в `weights/` |
-| `solution.py` | точка входа платформы: фичи → бленд LGBM+NN → success → правила fault_turn |
-| `sol/engine.py` | шаблонный парсер сообщений → 13 типов событий (опирается на поле `type`, устойчив к смене домена) |
-| `sol/features4.py` | 108 структурных признаков + словарь-независимые прокси для сдвинутого среза |
-| `sol/nn_model.py` | BiGRU 160×2 + attention над событийной последовательностью + табличная ветка |
-| `sol/localize.py` | правила локализации fault_turn (hit@2: conflict .94, dup .90, deadlock .78, …) |
+## Как устроено решение
 
-## Ожидаемое качество
+```
+JSON-колонки рана (goal, agents, messages, shared_state, artifacts, topology)
+        │
+        ▼
+engine.py ── шаблонный парсер сообщений → 13 семантических событий
+        │            (assign / deliver / work / wait / loop / drift / conflict_msg / …)
+        │            опора на структурное поле type → устойчив к смене домена
+        ▼
+features4.py ── 108 структурных признаков
+        │        учёт handoff (назначено/занято/произведено), взаимные ожидания,
+        │        конфликты перезаписи ключей state, серии циклов, дрейф-подмены,
+        │        словарь-независимые прокси для сдвинутого среза
+        ▼
+┌───────────────────────────┬──────────────────────────┐
+│  LightGBM (multiclass)    │  BiGRU над событийной    │
+│  1200 деревьев            │  последовательностью     │
+│                           │  (+ attention, таб. ветка│
+│                           │  128, бэггинг 3 сидов)   │
+└─────────────┬─────────────┴────────────┬─────────────┘
+              ▼                          ▼
+        logit-бленд 0.75/0.25 + смещения классов (подбор на holdout)
+              ▼
+LightGBM success (вход += one-hot предсказанного класса)
+              ▼
+localize.py ── правила локализации fault_turn по классу
+              (conflict .94 | dup .90 | deadlock .78 | drift .75 | DH .67 hit@2)
+```
 
-OOF MacroF1 ≈ 0.85 (бленд), SuccessF1 ≈ 0.94, fault_turn hit@2 ≈ 0.70.
-Композит на holdout ≈ 0.83.
+**Ключевые инженерные решения**
 
-## Воспроизводимость (п. 6 правил)
+- **Веса в сабмите**: тяжёлое обучение — офлайн (`pretrain.py`), в джобе только инференс —
+  **~30 секунд** вместо получасового лимита. Разрешено правилами (запуск один, он производит predictions.csv).
+- **Парсер на структурных полях**: словарь формулировок на сдвинутом срезе другой,
+  поэтому kind-классификация опирается на поле `type`, а не на текст.
+- **Защита от кривых входов**: smoke-тест платформы подсовывает test без полей ранов —
+  решение пишет валидный predictions.csv и выходит с кодом 0.
+- **Детерминизм**: все сиды зафиксированы, предобучение воспроизводится бит-в-бит.
+- Кроссплатформенность: zip-пути только `/`, LightGBM-модели грузятся через память
+  (пути с кириллицей на Windows LightGBM не переваривает).
 
-Все веса получаются одной командой `pretrain.py` (сид 42 везде). Скрипт лежит
-в корне архива сабмита.
+## Инструментарий локального улучшения (lab.py)
 
+Цикл «померил → улучшил → собрал сабмит» как на соревновании, только у себя:
+
+```bash
+python lab.py score   # обучит на 85% train и честно посчитает score формулы платформы на 15%
+python lab.py tune    # перебор бленда/порогов/смещений под композит → скор растёт
+python lab.py final   # соберёт my_submission.zip с лучшими настройками
+```
+
+Каждый прогон пишет строку в `scores_history.csv` — рост скора виден от запуска к запуску.
+
+## Структура репозитория
+
+```
+solution.py        инференс на платформе (3 режима: веса / обучение в джобе / smoke)
+pretrain.py        офлайн-обучение всех моделей + тюнинг порогов на OOF
+lab.py             локальная лаборатория: score / tune / final
+make_submission.py сборка сабмит-zip
+sol/               engine, features4, nn_model, localize + доки чемпионата
+README_LAB.md      инструкция к лаборатории
+submission.zip     готовый сабмит (веса OOF MacroF1 0.8531)
+referee_lab.zip    turnkey-комплект: код + веса + данные (для локального запуска)
+```
+
+## Стек
+
+Python 3.11 · pandas/numpy · scikit-learn · LightGBM · PyTorch (BiGRU, CPU/GPU) · zipfile/multiprocessing
+
+## Воспроизведение
+
+```bash
+pip install -r requirements.txt
+python pretrain.py --train data/train.csv --out weights --folds 5 --nn-epochs 10 --nn-seeds 1,2,3
+python make_submission.py --weights weights --out submission.zip
+# проверка контракта платформы:
+python solution.py --train data/train.csv --test data/test.csv --output predictions.csv
+```
