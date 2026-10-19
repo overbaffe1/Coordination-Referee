@@ -273,7 +273,8 @@ def main():
         lab_1h_te[np.arange(len(Xte)), pred_idx] = 1
         Xse = np.hstack([Xte.values.astype(np.float32), lab_1h_te])
         p_suc = suc.predict_proba(Xse)[:, 1]
-    pred_success = (p_suc > 0.5).astype(int)
+    _th = float((meta or {}).get('success_threshold', 0.5))
+    pred_success = (p_suc > _th).astype(int)
 
     # ------------------------------------------------- fault turn
     log("localising faults")
