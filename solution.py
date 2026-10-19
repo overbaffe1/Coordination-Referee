@@ -44,6 +44,12 @@ def log(msg):
     print("[%6.1fs] %s" % (time.time() - T0, msg), flush=True)
 
 
+def load_booster(path):
+    """Booster from a text model file, filesystem-agnostic (non-ASCII paths OK)."""
+    import lightgbm as lgb
+    with open(path, "r", encoding="utf-8") as f:
+        return lgb.Booster(model_str=f.read())
+
 def write_fallback(test, path, why):
     log("WARNING: %s -> constant predictions" % why)
     ids = test["run_id"] if "run_id" in test.columns else range(len(test))
@@ -164,7 +170,7 @@ def main():
     if has_lgb_lab:
         import lightgbm as lgb
         log("LGBM label: loading booster")
-        booster = lgb.Booster(model_file=os.path.join(wdir, "lgb_label.txt"))
+        booster = load_booster(os.path.join(wdir, "lgb_label.txt"))
         p_lgb = np.asarray(booster.predict(Xte.values), dtype=np.float64)
         if p_lgb.ndim == 1:
             p_lgb = p_lgb.reshape(-1, 7)
@@ -241,7 +247,7 @@ def main():
     if has_lgb_suc:
         import lightgbm as lgb
         log("LGBM success: loading booster")
-        booster = lgb.Booster(model_file=os.path.join(wdir, "lgb_success.txt"))
+        booster = load_booster(os.path.join(wdir, "lgb_success.txt"))
         lab_1h_te = np.zeros((len(Xte), 7), dtype=np.float32)
         lab_1h_te[np.arange(len(Xte)), pred_idx] = 1
         Xse = np.hstack([Xte.values.astype(np.float32), lab_1h_te])

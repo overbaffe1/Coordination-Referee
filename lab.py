@@ -149,7 +149,8 @@ def save_meta(wdir, meta):
 
 def build_success_probs(X, pred_idx, wdir):
     import lightgbm as lgb
-    booster = lgb.Booster(model_file=os.path.join(wdir, "lgb_success.txt"))
+    with open(os.path.join(wdir, "lgb_success.txt"), "r", encoding="utf-8") as f:
+        booster = lgb.Booster(model_str=f.read())
     lab_1h = np.zeros((len(X), 7), dtype=np.float32)
     lab_1h[np.arange(len(X)), pred_idx] = 1
     Xse = np.hstack([X.astype(np.float32), lab_1h])
@@ -200,7 +201,6 @@ def cmd_score(args):
     lab_1h = np.zeros((len(y), 7), dtype=np.float32)
     lab_1h[np.arange(len(y)), y] = 1
     lgb_suc = fit_lgb_success(np.hstack([Xtr.values.astype(np.float32), lab_1h]), s)
-    lgb_suc.booster_.save_model(os.path.join(CACHE, "lgb_success.txt"))
 
     p_nn_ho = None
     if not args.no_nn:

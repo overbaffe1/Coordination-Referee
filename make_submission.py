@@ -58,6 +58,8 @@ def main():
                 arc = os.path.basename(arc)
             if path.startswith(wdir):
                 arc = os.path.join("weights", os.path.relpath(path, wdir))
+            # zip must always use forward slashes (Windows-safe, Linux-friendly)
+            arc = arc.replace(os.sep, "/").replace("\\", "/")
             z.write(path, arc)
             print("  +", arc)
     size = os.path.getsize(args.out) / 1e6
